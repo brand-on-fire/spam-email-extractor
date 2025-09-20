@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Gmail Spam Sender Extractor",
+  "version": "1.0",
+  "description": "Extract sender email addresses from Gmail spam folder",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Extract Spam Senders"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

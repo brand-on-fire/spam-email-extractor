@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 300px;
+      padding: 20px;
+      font-family: Arial, sans-serif;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    
+    .header h1 {
+      margin: 0;
+      color: #333;
+      font-size: 18px;
+    }
+    
+    .extract-btn {
+      width: 100%;
+      padding: 12px;
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+    }
+    
+    .extract-btn:hover {
+      background-color: #45a049;
+    }
+    
+    .extract-btn:disabled {
+      background-color: #cccccc;
+      cursor: not-allowed;
+    }
+    
+    .copy-btn {
+      width: 100%;
+      padding: 10px;
+      background-color: #2196F3;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+      margin-top: 10px;
+    }
+    
+    .copy-btn:hover {
+      background-color: #1976D2;
+    }
+    
+    .results {
+      margin-top: 20px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .email-item {
+      padding: 8px;
+      margin: 4px 0;
+      background-color: #f5f5f5;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+    
+    .no-emails {
+      text-align: center;
+      color: #666;
+      font-style: italic;
+      margin-top: 20px;
+    }
+    
+    .count {
+      text-align: center;
+      margin-top: 10px;
+      font-weight: bold;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Gmail Spam Extractor</h1>
+    <p style="font-size: 12px; color: #666; margin: 5px 0;">Extract sender emails from Gmail spam folder</p>
+    <p style="font-size: 10px; color: #999; margin: 2px 0;">Fresh extraction each time - no data stored</p>
+  </div>
+  
+  <button id="extractBtn" class="extract-btn">Extract Sender Emails</button>
+  
+  <button id="copyBtn" class="copy-btn" style="display: none;">Copy All Emails</button>
+  
+  <div id="results" class="results" style="display: none;">
+    <div id="emailList"></div>
+    <div id="count" class="count"></div>
+  </div>
+  
+  <div id="noEmails" class="no-emails" style="display: none;">
+    No sender email addresses found. Make sure you're on Gmail spam folder.
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
