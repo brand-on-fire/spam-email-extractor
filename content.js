@@ -29,7 +29,7 @@ function extractSenderEmailsFromGmail() {
       return ['Please navigate to the Gmail Spam folder first'];
     }
     
-    // Look for email list items in the main content area only
+    // First try the targeted approach with Gmail DOM selectors
     const mainContentArea = document.querySelector('[role="main"]') || document.querySelector('.nH') || document.body;
     const emailListItems = mainContentArea.querySelectorAll('[role="listitem"], .zA, .yW, .yP, .y6, .zE');
     
@@ -49,11 +49,20 @@ function extractSenderEmailsFromGmail() {
           console.error(`Error processing email item ${index}:`, error);
         }
       });
-    } else {
-      console.log('No email list items found in spam folder');
     }
     
-    // Don't fall back to broader search - only extract from actual spam emails
+    // If we didn't find many emails with the targeted approach, fall back to comprehensive page search
+    if (emails.size < 5) {
+      console.log(`Targeted approach found ${emails.size} emails, falling back to comprehensive page search`);
+      const pageEmails = extractAllEmailsFromPage();
+      console.log(`Page search found ${pageEmails.length} emails`);
+      pageEmails.forEach(email => {
+        if (shouldIncludeEmail(email)) {
+          emails.add(email.toLowerCase());
+        }
+      });
+      console.log(`Final email count after filtering: ${emails.size}`);
+    }
     
   } catch (error) {
     console.error('Error in extractSenderEmailsFromGmail:', error);
@@ -92,28 +101,54 @@ function isInSpamFolder() {
 function extractEmailsFromElement(element) {
   const emails = [];
   
-  // Check for email attribute first (most reliable)
-  const emailAttr = element.querySelector('[email]');
-  if (emailAttr && emailAttr.getAttribute('email')) {
-    const email = emailAttr.getAttribute('email').trim();
-    if (isValidEmail(email)) {
-      emails.push(email);
-    }
+  // 1) Extract from common Gmail attributes across this element subtree
+  try {
+    const nodes = element.querySelectorAll('[email], [data-hovercard-id], [data-address], a[href^="mailto:"], [aria-label]');
+    nodes.forEach(node => {
+      const attrCandidates = [];
+      if (node.hasAttribute('email')) attrCandidates.push(node.getAttribute('email'));
+      if (node.hasAttribute('data-hovercard-id')) attrCandidates.push(node.getAttribute('data-hovercard-id'));
+      if (node.hasAttribute('data-address')) attrCandidates.push(node.getAttribute('data-address'));
+      if (node.hasAttribute('aria-label')) attrCandidates.push(node.getAttribute('aria-label'));
+      if (node.tagName === 'A' && node.hasAttribute('href')) attrCandidates.push(node.getAttribute('href'));
+
+      attrCandidates.forEach(raw => {
+        if (!raw) return;
+        // Support mailto: links and labels like "Name <email@domain>"
+        const candidates = [];
+        const href = String(raw);
+        if (href.startsWith('mailto:')) {
+          candidates.push(href.replace(/^mailto:/i, ''));
+        } else {
+          candidates.push(href);
+        }
+        const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+        candidates.forEach(str => {
+          let m;
+          while ((m = emailRegex.exec(str)) !== null) {
+            let found = cleanEmailAddress(m[1].trim());
+            if (isValidEmail(found)) {
+              emails.push(found);
+            }
+          }
+        });
+      });
+    });
+  } catch (e) {
+    // Swallow and continue with text-based extraction
   }
-  
-  // Extract from text content with improved regex
+
+  // 2) Extract from text content as a fallback within the element
   const text = element.textContent || element.innerText;
   if (text) {
-    // More precise regex that captures emails more accurately
     const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-    
+
     let match;
     while ((match = emailRegex.exec(text)) !== null) {
       let email = match[1].trim();
-      
-      // Clean up common prefixes that might be attached
+
       email = cleanEmailAddress(email);
-      
+
       if (isValidEmail(email)) {
         emails.push(email);
       }
@@ -209,22 +244,58 @@ function isValidEmail(email) {
 function extractAllEmailsFromPage() {
   const emails = [];
   
-  // Extract from page source with improved regex
-  const pageSource = document.documentElement.outerHTML;
-  
-  // More precise regex that captures emails more accurately
-  const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
-  
-  let match;
-  while ((match = emailRegex.exec(pageSource)) !== null) {
-    let email = match[1].trim();
+  try {
+    // Extract from page source with improved regex
+    const pageSource = document.documentElement.outerHTML;
+    console.log('Page source length:', pageSource.length);
     
-    // Clean up common prefixes that might be attached
-    email = cleanEmailAddress(email);
+    // More comprehensive regex that captures emails more accurately
+    const emailRegex = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
     
-    if (isValidEmail(email)) {
-      emails.push(email);
+    let match;
+    let matchCount = 0;
+    while ((match = emailRegex.exec(pageSource)) !== null) {
+      matchCount++;
+      let email = match[1].trim();
+      
+      // Clean up common prefixes that might be attached
+      email = cleanEmailAddress(email);
+      
+      if (isValidEmail(email)) {
+        emails.push(email);
+        console.log('Found valid email:', email);
+      } else {
+        console.log('Invalid email after cleaning:', email);
+      }
     }
+    
+    console.log(`Total email matches found: ${matchCount}, valid emails: ${emails.length}`);
+    
+    // Also try to find emails in specific Gmail data attributes
+    const dataElements = document.querySelectorAll('[data-hovercard-id], [data-address], [email], [aria-label]');
+    console.log(`Found ${dataElements.length} elements with email-related attributes`);
+    
+    dataElements.forEach((element, index) => {
+      const attrs = ['data-hovercard-id', 'data-address', 'email', 'aria-label'];
+      attrs.forEach(attr => {
+        const value = element.getAttribute(attr);
+        if (value && value.includes('@')) {
+          const emailMatches = value.match(/([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g);
+          if (emailMatches) {
+            emailMatches.forEach(matchedEmail => {
+              const cleaned = cleanEmailAddress(matchedEmail);
+              if (isValidEmail(cleaned)) {
+                emails.push(cleaned);
+                console.log(`Found email in ${attr}:`, cleaned);
+              }
+            });
+          }
+        }
+      });
+    });
+    
+  } catch (error) {
+    console.error('Error in extractAllEmailsFromPage:', error);
   }
   
   return emails;
