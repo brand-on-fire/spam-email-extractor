@@ -1,43 +1,75 @@
 /**
- * Spam Email Extractor — Cloudflare Worker
+ * Spam Email Extractor — Cloudflare Worker (Multi-Account)
  *
- * Runs every 12 hours via cron trigger.
- * 1. Reads spam from Gmail
- * 2. Deduplicates by sender email against Google Sheet
- * 3. Rates each new spam message 1-10 using Cloudflare AI
+ * Two Google accounts, each running every 4 hours offset by 2 hours:
+ *   Account 1: 0, 4, 8, 12, 16, 20 UTC  → /u/0/ links
+ *   Account 2: 2, 6, 10, 14, 18, 22 UTC  → /u/1/ links
+ *
+ * Flow per account:
+ * 1. Reads latest 25 spam emails from Gmail
+ * 2. Deduplicates by sender email against that account's Google Sheet
+ * 3. Rates each new sender 1-5 using Cloudflare AI
  * 4. Appends [email, subject, rating, gmail_link] to the Sheet
- *
- * AI budget: max 20 emails/run × 2 runs/day = 40 AI calls/day
- * ≈ 2,000–3,200 neurons/day (well under 50% of 10,000 free)
  */
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1";
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
-const MAX_EMAILS_PER_RUN = 20;
+const MAX_EMAILS_PER_RUN = 25;
 const SNIPPET_MAX_CHARS = 500;
+const BATCH_SIZE = 25;
+
+// ─── Account Routing ─────────────────────────────────────────────────────────
+
+const ACCOUNT_1_CRON = "0 0,4,8,12,16,20 * * *";
+const ACCOUNT_2_CRON = "0 2,6,10,14,18,22 * * *";
+
+function getAccountConfig(env, cronExpression) {
+  if (cronExpression === ACCOUNT_2_CRON) {
+    return {
+      name: "Account 2",
+      clientId: env.G_CLIENT_ID_2,
+      clientSecret: env.G_CLIENT_SECRET_2,
+      refreshToken: env.G_REFRESH_TOKEN_2,
+      sheetId: env.SHEET_ID_2,
+      gmailUserIndex: "1", // /u/1/ for second logged-in account
+    };
+  }
+  // Default: Account 1
+  return {
+    name: "Account 1",
+    clientId: env.G_CLIENT_ID,
+    clientSecret: env.G_CLIENT_SECRET,
+    refreshToken: env.G_REFRESH_TOKEN,
+    sheetId: env.SHEET_ID,
+    gmailUserIndex: "0", // /u/0/ for default account
+  };
+}
+
+// ─── Handlers ────────────────────────────────────────────────────────────────
 
 export default {
-  /**
-   * Cron trigger handler — runs every 12 hours
-   */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(processSpam(env));
+    const account = getAccountConfig(env, event.cron);
+    ctx.waitUntil(processSpam(env, account));
   },
 
-  /**
-   * HTTP handler — for manual testing via curl or browser
-   */
   async fetch(request, env, ctx) {
-    // Allow manual trigger via POST or via the /__scheduled test path
     const url = new URL(request.url);
+
+    // Manual trigger: ?account=2 to run account 2, default is account 1
     if (url.pathname === "/__scheduled" || request.method === "POST") {
-      ctx.waitUntil(processSpam(env));
-      return new Response("Spam harvester triggered. Check logs with `wrangler tail`.", {
+      const accountNum = url.searchParams.get("account") || "1";
+      const cronKey = accountNum === "2" ? ACCOUNT_2_CRON : ACCOUNT_1_CRON;
+      const account = getAccountConfig(env, cronKey);
+      ctx.waitUntil(processSpam(env, account));
+      return new Response(`Spam harvester triggered for ${account.name}. Check logs with \`wrangler tail\`.`, {
         status: 200,
       });
     }
     return new Response(
-      "Spam Email Extractor Worker is running.\nPOST to this URL or visit /__scheduled to trigger manually.",
+      "Spam Email Extractor Worker (Multi-Account)\n" +
+      "POST /__scheduled          → trigger Account 1\n" +
+      "POST /__scheduled?account=2 → trigger Account 2",
       { status: 200 }
     );
   },
@@ -45,77 +77,92 @@ export default {
 
 // ─── Core Logic ──────────────────────────────────────────────────────────────
 
-async function processSpam(env) {
+async function processSpam(env, account) {
   try {
-    console.log("[spam-extractor] Starting spam harvest...");
+    console.log(`[spam-extractor] [${account.name}] Starting spam harvest...`);
 
     // 1. Get fresh Google access token
-    const accessToken = await getGoogleAccessToken(env);
-    console.log("[spam-extractor] Got Google access token");
+    const accessToken = await getGoogleAccessToken(account);
+    console.log(`[spam-extractor] [${account.name}] Got Google access token`);
 
-    // 2. Read existing emails from Sheet column A (dedup set)
-    const existingEmails = await getExistingEmails(accessToken, env.SHEET_ID);
-    console.log(`[spam-extractor] Found ${existingEmails.size} existing emails in sheet`);
+    // 2. Read existing emails from Sheet column A
+    const existingEmails = await getExistingEmails(accessToken, account.sheetId);
+    console.log(`[spam-extractor] [${account.name}] Found ${existingEmails.size} existing emails in sheet`);
 
     // 3. Fetch spam message IDs from Gmail
     const messageIds = await getSpamMessageIds(accessToken);
-    console.log(`[spam-extractor] Found ${messageIds.length} spam messages in Gmail`);
+    console.log(`[spam-extractor] [${account.name}] Found ${messageIds.length} spam messages in Gmail`);
 
     if (messageIds.length === 0) {
-      console.log("[spam-extractor] No spam found. Exiting.");
+      console.log(`[spam-extractor] [${account.name}] No spam found. Exiting.`);
       return;
     }
 
-    // 4. Process each message
-    let added = 0;
+    // 4. Batch-fetch all message metadata
+    const allMessages = await batchGetMessages(accessToken, messageIds);
+    console.log(`[spam-extractor] [${account.name}] Fetched metadata for ${allMessages.length} messages`);
+
+    // 5. Filter to only new (non-duplicate) senders
+    const newMessages = [];
     let skipped = 0;
 
-    for (const msgId of messageIds) {
-      const msgData = await getMessageDetails(accessToken, msgId);
-      if (!msgData) continue;
-
-      const { email, subject, snippet } = msgData;
-
-      // Dedup check by sender email
-      if (existingEmails.has(email.toLowerCase())) {
+    for (const msg of allMessages) {
+      if (!msg) continue;
+      if (existingEmails.has(msg.email.toLowerCase())) {
         skipped++;
         continue;
       }
+      existingEmails.add(msg.email.toLowerCase());
+      newMessages.push(msg);
+    }
 
-      // 5. Ask Cloudflare AI for spam rating (only for new senders)
-      const rating = await getSpamRating(env.AI, subject, snippet);
+    console.log(`[spam-extractor] [${account.name}] ${newMessages.length} new senders, ${skipped} duplicates`);
 
-      // 6. Build Gmail link (u/0 = default account)
-      const gmailLink = `https://mail.google.com/mail/u/0/#spam/${msgId}`;
+    if (newMessages.length === 0) {
+      console.log(`[spam-extractor] [${account.name}] No new senders. Exiting.`);
+      return;
+    }
 
-      // 7. Append row to Google Sheet
-      await appendToSheet(accessToken, env.SHEET_ID, [email, subject, rating, gmailLink]);
+    // 6. Rate each new message with AI
+    const maxAiCalls = 44;
+    const newRows = [];
 
-      // Track in memory to avoid dupes within the same run
-      existingEmails.add(email.toLowerCase());
-      added++;
+    for (let i = 0; i < newMessages.length && i < maxAiCalls; i++) {
+      const msg = newMessages[i];
+      const rating = await getSpamRating(env.AI, msg.subject, msg.snippet);
+      const gmailLink = `https://mail.google.com/mail/u/${account.gmailUserIndex}/#spam/${msg.id}`;
+      newRows.push([msg.email, msg.subject, rating, gmailLink]);
+      console.log(`[spam-extractor] [${account.name}] Rated: ${msg.email} → ${rating}`);
+    }
 
-      console.log(`[spam-extractor] Added: ${email} (rating: ${rating})`);
+    if (newMessages.length > maxAiCalls) {
+      console.log(`[spam-extractor] [${account.name}] ${newMessages.length - maxAiCalls} emails deferred to next run`);
+    }
+
+    // 7. Batch write all new rows to Sheet
+    if (newRows.length > 0) {
+      await batchAppendToSheet(accessToken, account.sheetId, newRows);
+      console.log(`[spam-extractor] [${account.name}] Wrote ${newRows.length} rows to sheet`);
     }
 
     console.log(
-      `[spam-extractor] Harvest complete! Added: ${added}, Skipped (duplicates): ${skipped}`
+      `[spam-extractor] [${account.name}] Harvest complete! Added: ${newRows.length}, Skipped: ${skipped}`
     );
   } catch (err) {
-    console.error(`[spam-extractor] Error: ${err.message}`, err.stack);
+    console.error(`[spam-extractor] [${account.name}] Error: ${err.message}`, err.stack);
   }
 }
 
 // ─── Google Auth ─────────────────────────────────────────────────────────────
 
-async function getGoogleAccessToken(env) {
+async function getGoogleAccessToken(account) {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      client_id: env.G_CLIENT_ID,
-      client_secret: env.G_CLIENT_SECRET,
-      refresh_token: env.G_REFRESH_TOKEN,
+      client_id: account.clientId,
+      client_secret: account.clientSecret,
+      refresh_token: account.refreshToken,
       grant_type: "refresh_token",
     }),
   });
@@ -149,7 +196,7 @@ async function getExistingEmails(accessToken, sheetId) {
   return emails;
 }
 
-async function appendToSheet(accessToken, sheetId, rowValues) {
+async function batchAppendToSheet(accessToken, sheetId, rows) {
   const url = `${SHEETS_API}/${sheetId}/values/Sheet1!A:D:append?valueInputOption=USER_ENTERED`;
   const res = await fetch(url, {
     method: "POST",
@@ -157,12 +204,12 @@ async function appendToSheet(accessToken, sheetId, rowValues) {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ values: [rowValues] }),
+    body: JSON.stringify({ values: rows }),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Sheets append failed: ${res.status} ${errText}`);
+    throw new Error(`Sheets batch append failed: ${res.status} ${errText}`);
   }
 }
 
@@ -179,49 +226,90 @@ async function getSpamMessageIds(accessToken) {
   return data.messages.map((m) => m.id);
 }
 
-async function getMessageDetails(accessToken, messageId) {
-  const url = `${GMAIL_API}/users/me/messages/${messageId}?format=full`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+async function batchGetMessages(accessToken, messageIds) {
+  const results = [];
 
-  const data = await res.json();
-  if (!data.payload || !data.payload.headers) return null;
+  for (let i = 0; i < messageIds.length; i += BATCH_SIZE) {
+    const chunk = messageIds.slice(i, i + BATCH_SIZE);
+    const boundary = "batch_spam_extractor_" + Date.now();
 
-  const headers = data.payload.headers;
-  const rawFrom = headers.find((h) => h.name === "From")?.value || "";
-  const subject = headers.find((h) => h.name === "Subject")?.value || "(No Subject)";
+    let body = "";
+    for (const msgId of chunk) {
+      body += `--${boundary}\r\nContent-Type: application/http\r\n\r\nGET /gmail/v1/users/me/messages/${msgId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject\r\n\r\n`;
+    }
+    body += `--${boundary}--`;
 
-  // Extract clean email address using regex
-  const emailMatch = rawFrom.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
-  if (!emailMatch) return null;
+    const res = await fetch("https://www.googleapis.com/batch/gmail/v1", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": `multipart/mixed; boundary=${boundary}`,
+      },
+      body,
+    });
 
-  // Truncate snippet to save AI tokens
-  const snippet = (data.snippet || "").substring(0, SNIPPET_MAX_CHARS);
+    const responseText = await res.text();
+    const parsed = parseBatchResponse(responseText, chunk);
+    results.push(...parsed);
+  }
 
-  return {
-    email: emailMatch[0],
-    subject,
-    snippet,
-  };
+  return results;
+}
+
+function parseBatchResponse(responseText, messageIds) {
+  const results = [];
+  const parts = responseText.split(/--batch_\S+/);
+
+  let msgIndex = 0;
+  for (const part of parts) {
+    if (!part.trim() || part.trim() === "--") continue;
+
+    const jsonMatch = part.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) continue;
+
+    try {
+      const data = JSON.parse(jsonMatch[0]);
+
+      if (data.payload && data.payload.headers) {
+        const headers = data.payload.headers;
+        const rawFrom = headers.find((h) => h.name === "From")?.value || "";
+        const subject = headers.find((h) => h.name === "Subject")?.value || "(No Subject)";
+
+        const emailMatch = rawFrom.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+        if (emailMatch) {
+          const snippet = (data.snippet || "").substring(0, SNIPPET_MAX_CHARS);
+          results.push({
+            id: data.id || messageIds[msgIndex],
+            email: emailMatch[0],
+            subject,
+            snippet,
+          });
+        }
+      }
+    } catch (e) {
+      // Skip unparseable responses
+    }
+    msgIndex++;
+  }
+
+  return results;
 }
 
 // ─── Cloudflare AI ───────────────────────────────────────────────────────────
 
 async function getSpamRating(ai, subject, snippet) {
   try {
-    const prompt = `Rate this email's likelihood of being spam/malicious from 1-10 (10 = obvious spam). Reply with ONLY a single number.\n\nSubject: ${subject}\nPreview: ${snippet}`;
+    const prompt = `Rate this email's spam likelihood from 1-5 (5 = obvious spam). Reply with ONLY a single number.\n\nSubject: ${subject}\nPreview: ${snippet}`;
 
     const response = await ai.run("@cf/meta/llama-3-8b-instruct", {
       messages: [{ role: "user", content: prompt }],
       max_tokens: 4,
     });
 
-    // Extract just the number from the response
     const match = response.response.match(/\d+/);
     if (match) {
       const num = parseInt(match[0], 10);
-      return num >= 1 && num <= 10 ? String(num) : "N/A";
+      return num >= 1 && num <= 5 ? String(num) : "N/A";
     }
     return "N/A";
   } catch (err) {
