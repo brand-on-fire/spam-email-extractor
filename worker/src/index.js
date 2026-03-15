@@ -20,11 +20,10 @@ const BATCH_SIZE = 25;
 
 // ─── Account Routing ─────────────────────────────────────────────────────────
 
-const ACCOUNT_1_CRON = "0 0,4,8,12,16,20 * * *";
-const ACCOUNT_2_CRON = "0 2,6,10,14,18,22 * * *";
-
-function getAccountConfig(env, cronExpression) {
-  if (cronExpression === ACCOUNT_2_CRON) {
+// Account 1 runs at even-divisible-by-4 hours: 0, 4, 8, 12, 16, 20
+// Account 2 runs at offset hours: 2, 6, 10, 14, 18, 22
+function getAccountConfig(env, accountNum) {
+  if (accountNum === 2) {
     return {
       name: "Account 2",
       clientId: env.G_CLIENT_ID_2,
@@ -45,11 +44,18 @@ function getAccountConfig(env, cronExpression) {
   };
 }
 
+function getAccountNumFromHour() {
+  const hour = new Date().getUTCHours();
+  // hours 0,4,8,12,16,20 → Account 1 | hours 2,6,10,14,18,22 → Account 2
+  return (hour % 4 === 0) ? 1 : 2;
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 export default {
   async scheduled(event, env, ctx) {
-    const account = getAccountConfig(env, event.cron);
+    const accountNum = getAccountNumFromHour();
+    const account = getAccountConfig(env, accountNum);
     ctx.waitUntil(processSpam(env, account));
   },
 
@@ -58,9 +64,8 @@ export default {
 
     // Manual trigger: ?account=2 to run account 2, default is account 1
     if (url.pathname === "/__scheduled" || request.method === "POST") {
-      const accountNum = url.searchParams.get("account") || "1";
-      const cronKey = accountNum === "2" ? ACCOUNT_2_CRON : ACCOUNT_1_CRON;
-      const account = getAccountConfig(env, cronKey);
+      const manualNum = parseInt(url.searchParams.get("account") || "1", 10);
+      const account = getAccountConfig(env, manualNum);
       ctx.waitUntil(processSpam(env, account));
       return new Response(`Spam harvester triggered for ${account.name}. Check logs with \`wrangler tail\`.`, {
         status: 200,

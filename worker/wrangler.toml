@@ -7,6 +7,6 @@ account_id = "0e1e036eca275fbc0290725f004786f4"
 binding = "AI"
 
 [triggers]
-# Account 1: hours 0, 4, 8, 12, 16, 20
-# Account 2: hours 2, 6, 10, 14, 18, 22 (offset by 2)
-crons = ["0 0,4,8,12,16,20 * * *", "0 2,6,10,14,18,22 * * *"]
+# Single cron for both accounts: route by UTC hour in JS
+# Even hours (0,4,8,12,16,20) → Account 1 | Odd (2,6,10,14,18,22) → Account 2
+crons = ["0 */2 * * *"]
