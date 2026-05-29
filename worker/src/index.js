@@ -306,7 +306,9 @@ async function getSpamRating(ai, subject, snippet) {
   try {
     const prompt = `Rate this email's spam likelihood from 1-5 (5 = obvious spam). Reply with ONLY a single number.\n\nSubject: ${subject}\nPreview: ${snippet}`;
 
-    const response = await ai.run("@cf/meta/llama-3-8b-instruct", {
+    // 1B model is plenty for extracting a single 1-5 digit; cheapest retained
+    // Workers AI model after the May 30 2026 deprecation of llama-3-8b-instruct.
+    const response = await ai.run("@cf/meta/llama-3.2-1b-instruct", {
       messages: [{ role: "user", content: prompt }],
       max_tokens: 4,
     });
