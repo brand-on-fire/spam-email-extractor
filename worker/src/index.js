@@ -62,6 +62,18 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Self-test: synthesize a class-action message and run it through the
+    // real alert pipeline. Exercises gmail.send scope without needing a
+    // real class-action notice to land in spam.
+    if (url.searchParams.get("selftest") === "1") {
+      ctx.waitUntil(runSelfTest(env));
+      return new Response(
+        `Self-test dispatched. A synthetic alert will be sent to ${CLASS_ACTION_RECIPIENT} ` +
+        "if Account 1 matches that mailbox. Check logs and inbox.",
+        { status: 200 }
+      );
+    }
+
     // Manual trigger: ?account=2 to run account 2, default is account 1
     if (url.pathname === "/__scheduled" || request.method === "POST") {
       const manualNum = parseInt(url.searchParams.get("account") || "1", 10);
@@ -74,7 +86,8 @@ export default {
     return new Response(
       "Spam Email Extractor Worker (Multi-Account)\n" +
       "POST /__scheduled          → trigger Account 1\n" +
-      "POST /__scheduled?account=2 → trigger Account 2",
+      "POST /__scheduled?account=2 → trigger Account 2\n" +
+      "GET  /?selftest=1          → send synthetic class-action alert (verifies gmail.send scope)",
       { status: 200 }
     );
   },
@@ -90,9 +103,29 @@ async function processSpam(env, account) {
     const accessToken = await getGoogleAccessToken(account);
     console.log(`[spam-extractor] [${account.name}] Got Google access token`);
 
-    // 2. Read existing emails from Sheet column A
+    // 2. Identify the authenticated account. Class-action alert handling is
+    //    restricted to CLASS_ACTION_RECIPIENT (the only account granted the
+    //    `gmail.send` scope); other accounts skip that path entirely and
+    //    behave exactly as the original spam harvester.
+    const myEmail = await getMyEmailAddress(accessToken);
+    const classActionEnabled =
+      myEmail.toLowerCase() === CLASS_ACTION_RECIPIENT.toLowerCase();
+    console.log(
+      `[spam-extractor] [${account.name}] Authenticated as ${myEmail}; class-action alerts ${classActionEnabled ? "ENABLED" : "disabled"}`
+    );
+
+    // 3. Read existing emails from Sheet column A (spam sender dedup) and,
+    //    only when class-action alerts are enabled, the previously-alerted
+    //    class-action message IDs from column F.
     const existingEmails = await getExistingEmails(accessToken, account.sheetId);
     console.log(`[spam-extractor] [${account.name}] Found ${existingEmails.size} existing emails in sheet`);
+
+    const alertedIds = classActionEnabled
+      ? await getAlertedMessageIds(accessToken, account.sheetId)
+      : new Set();
+    if (classActionEnabled) {
+      console.log(`[spam-extractor] [${account.name}] Found ${alertedIds.size} previously-alerted class-action IDs`);
+    }
 
     // 3. Fetch spam message IDs from Gmail
     const messageIds = await getSpamMessageIds(accessToken);
@@ -107,12 +140,40 @@ async function processSpam(env, account) {
     const allMessages = await batchGetMessages(accessToken, messageIds);
     console.log(`[spam-extractor] [${account.name}] Fetched metadata for ${allMessages.length} messages`);
 
-    // 5. Filter to only new (non-duplicate) senders
+    // 5. Filter to only new (non-duplicate) senders.
+    //    Class-action / settlement notices are LEFT in spam (so the catch
+    //    stays intact) but trigger an alert email to the account owner so
+    //    they don't miss a claim deadline. Excluded from the spam sheet.
     const newMessages = [];
     let skipped = 0;
+    let alerted = 0;
+    let alertSkippedDup = 0;
+    const newAlertedIds = [];
 
     for (const msg of allMessages) {
       if (!msg) continue;
+
+      if (classActionEnabled && looksLikeClassAction(msg.email, msg.subject, msg.snippet)) {
+        if (alertedIds.has(msg.id)) {
+          alertSkippedDup++;
+          continue; // already alerted in a previous run
+        }
+        try {
+          await sendClassActionAlert(accessToken, account, msg, myEmail);
+          alertedIds.add(msg.id);
+          newAlertedIds.push(msg.id);
+          alerted++;
+          console.log(
+            `[spam-extractor] [${account.name}] ALERT sent for class-action: ${msg.email} | ${msg.subject}`
+          );
+        } catch (e) {
+          console.error(
+            `[spam-extractor] [${account.name}] Alert failed for ${msg.id} (${msg.email}): ${e.message}`
+          );
+        }
+        continue;
+      }
+
       if (existingEmails.has(msg.email.toLowerCase())) {
         skipped++;
         continue;
@@ -121,7 +182,26 @@ async function processSpam(env, account) {
       newMessages.push(msg);
     }
 
-    console.log(`[spam-extractor] [${account.name}] ${newMessages.length} new senders, ${skipped} duplicates`);
+    if (classActionEnabled) {
+      console.log(
+        `[spam-extractor] [${account.name}] ${newMessages.length} new senders, ${skipped} duplicates, ${alerted} class-action alerts sent, ${alertSkippedDup} already-alerted`
+      );
+    } else {
+      console.log(
+        `[spam-extractor] [${account.name}] ${newMessages.length} new senders, ${skipped} duplicates`
+      );
+    }
+
+    // Persist newly-alerted message IDs so we don't re-alert next run.
+    if (classActionEnabled && newAlertedIds.length > 0) {
+      try {
+        await appendAlertedMessageIds(accessToken, account.sheetId, newAlertedIds);
+      } catch (e) {
+        console.error(
+          `[spam-extractor] [${account.name}] Failed to persist alerted IDs: ${e.message}`
+        );
+      }
+    }
 
     if (newMessages.length === 0) {
       console.log(`[spam-extractor] [${account.name}] No new senders. Exiting.`);
@@ -151,7 +231,7 @@ async function processSpam(env, account) {
     }
 
     console.log(
-      `[spam-extractor] [${account.name}] Harvest complete! Added: ${newRows.length}, Skipped: ${skipped}`
+      `[spam-extractor] [${account.name}] Harvest complete! Added: ${newRows.length}, Skipped: ${skipped}, Alerted: ${alerted}`
     );
   } catch (err) {
     console.error(`[spam-extractor] [${account.name}] Error: ${err.message}`, err.stack);
@@ -323,4 +403,249 @@ async function getSpamRating(ai, subject, snippet) {
     console.error(`[spam-extractor] AI rating failed: ${err.message}`);
     return "ERR";
   }
+}
+
+// ─── Class-Action Alert ──────────────────────────────────────────────────────
+//
+// Gmail's spam filter routinely eats legitimate class-action / settlement
+// notices because they look like bulk mail. Missing them costs real money
+// (claim deadlines pass). We detect them by:
+//   1. Subject keywords that are highly specific to settlement notices, or
+//   2. Sender domain matching a known settlement-administrator firm.
+// On match, we leave the original message in spam (so the catch stays
+// intact) and send the account owner a heads-up email pointing to it.
+// Dedup is via column F of the same Google Sheet so we don't re-alert on
+// every cron tick until the message falls out of the top 25.
+//
+// Only enabled for one account — the other Google account in this worker
+// is read-only and would 403 on `messages.send`.
+
+export const CLASS_ACTION_RECIPIENT = "brandon@brandonernst.com";
+
+const CLASS_ACTION_SUBJECT_PATTERNS = [
+  /\bclass[-\s]action\b/i,
+  /\bnotice of (proposed )?settlement\b/i,
+  /\bnotice of class action\b/i,
+  /\bsettlement administrator\b/i,
+  /\bsettlement (notice|payment|fund|benefit|check)\b/i,
+  /\bclaim (deadline|form|period)\b/i,
+  /\bproof of claim\b/i,
+  /\bcourt[-\s]approved notice\b/i,
+  /\byou may be entitled to (compensation|payment|cash|money|a payment|benefits)\b/i,
+  /\bif you (purchased|bought|used|owned|paid for|are a (member|class member))\b/i,
+];
+
+// Known U.S. class-action / settlement administrator domains. Mail from any
+// of these is treated as a rescue regardless of subject.
+const CLASS_ACTION_ADMIN_DOMAINS = new Set([
+  "kccllc.com",
+  "epiqglobal.com",
+  "atticusadmin.com",
+  "noticeadministrator.com",
+  "verita-global.com",
+  "veritaglobal.com",
+  "kroll.com",
+  "ra.kroll.com",
+  "gcginc.com",
+  "stretto.com",
+  "primeclerk.com",
+  "donlinrecano.com",
+  "rg2claims.com",
+  "rg2llc.com",
+  "yourclassactionnotice.com",
+  "classaction.org",
+  "angeiongroup.com",
+  "angeion-group.com",
+  "jndla.com",
+  "claimsadministrator.com",
+  "a-bsettlement.com",
+  "classactionrebates.com",
+  "noticeadmin.com",
+  "simpluris.com",
+  "ilym.com",
+  "rustconsulting.com",
+]);
+
+export function looksLikeClassAction(email, subject, snippet) {
+  const domain = (email.split("@")[1] || "").toLowerCase();
+
+  // Known administrator domain → rescue regardless of subject.
+  if (CLASS_ACTION_ADMIN_DOMAINS.has(domain)) return true;
+  for (const adminDomain of CLASS_ACTION_ADMIN_DOMAINS) {
+    if (domain.endsWith("." + adminDomain)) return true;
+  }
+
+  // Subject match → strong signal on its own.
+  for (const pattern of CLASS_ACTION_SUBJECT_PATTERNS) {
+    if (pattern.test(subject)) return true;
+  }
+
+  // Snippet match: require "class action" co-occurring with a second
+  // settlement-flavored term to suppress false positives.
+  const snippetText = snippet || "";
+  if (
+    /\bclass[-\s]action\b/i.test(snippetText) &&
+    /(settlement|claim|notice|lawsuit|litigation|court)/i.test(snippetText)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+async function getMyEmailAddress(accessToken) {
+  const url = `${GMAIL_API}/users/me/profile`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(`Gmail profile ${res.status}: ${await res.text()}`);
+  }
+  const data = await res.json();
+  if (!data.emailAddress) {
+    throw new Error("No emailAddress in Gmail profile response");
+  }
+  return data.emailAddress;
+}
+
+async function getAlertedMessageIds(accessToken, sheetId) {
+  // Column F of Sheet1 is reserved for class-action message IDs that have
+  // already triggered an alert email. Reading an all-empty range returns no
+  // values, so this is safe on first run before column F has anything in it.
+  const url = `${SHEETS_API}/${sheetId}/values/Sheet1!F:F`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = await res.json();
+  const ids = new Set();
+  if (data.values) {
+    for (const row of data.values) {
+      if (row[0]) ids.add(row[0]);
+    }
+  }
+  return ids;
+}
+
+async function appendAlertedMessageIds(accessToken, sheetId, ids) {
+  const url =
+    `${SHEETS_API}/${sheetId}/values/Sheet1!F:F:append` +
+    `?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const rows = ids.map((id) => [id]);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values: rows }),
+  });
+  if (!res.ok) {
+    throw new Error(`Sheets F-append ${res.status}: ${await res.text()}`);
+  }
+}
+
+async function sendClassActionAlert(accessToken, account, msg, myEmail) {
+  const gmailLink = `https://mail.google.com/mail/u/${account.gmailUserIndex}/#spam/${msg.id}`;
+  const safeSnippet = defangUrls(msg.snippet || "(no preview available)");
+  const subjectLine = `⚠️ Possible class action in spam: ${msg.subject}`;
+
+  const body = [
+    "A potential class-action or settlement notice was detected in your",
+    "spam folder. The original message has been left in spam — open the",
+    "Gmail link below to review and move it to your inbox if it looks",
+    "legitimate.",
+    "",
+    `From:    ${msg.email}`,
+    `Subject: ${msg.subject}`,
+    "",
+    "Preview (URLs defanged for safety — do not click):",
+    safeSnippet,
+    "",
+    "Open original in Gmail spam:",
+    gmailLink,
+    "",
+    "--",
+    "spam-email-extractor worker",
+  ].join("\r\n");
+
+  const raw = [
+    `From: ${myEmail}`,
+    `To: ${myEmail}`,
+    `Subject: ${mimeEncodeHeader(subjectLine)}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "",
+    body,
+  ].join("\r\n");
+
+  const url = `${GMAIL_API}/users/me/messages/send`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ raw: base64UrlEncode(raw) }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Gmail send ${res.status}: ${await res.text()}`);
+  }
+}
+
+// Defang URLs in untrusted snippet content so Gmail's auto-linker doesn't
+// turn a spam phishing link into a clickable target inside our alert.
+export function defangUrls(s) {
+  return s.replace(/https?/gi, (m) => m.replace(/t/g, "x").replace(/T/g, "X"));
+}
+
+export function base64UrlEncode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Self-test: synthesize a class-action message and exercise the alert
+// pipeline end-to-end. Only sends if Account 1 authenticates as the
+// configured recipient — otherwise aborts loudly.
+async function runSelfTest(env) {
+  try {
+    const account = getAccountConfig(env, 1);
+    const accessToken = await getGoogleAccessToken(account);
+    const myEmail = await getMyEmailAddress(accessToken);
+    if (myEmail.toLowerCase() !== CLASS_ACTION_RECIPIENT.toLowerCase()) {
+      console.error(
+        `[selftest] Account 1 authenticates as ${myEmail}, not ${CLASS_ACTION_RECIPIENT}. Aborting.`
+      );
+      return;
+    }
+    const synthetic = {
+      id: "selftest-" + Date.now(),
+      email: "self-test@spam-extractor.local",
+      subject: "spam-extractor self-test (safe to delete)",
+      snippet:
+        "If you received this, the gmail.send scope and the class-action " +
+        "alert pipeline are wired up correctly. Visit http://example.com to " +
+        "confirm URL defanging works. Safe to delete.",
+    };
+    console.log(`[selftest] sending synthetic alert to ${myEmail}`);
+    await sendClassActionAlert(accessToken, account, synthetic, myEmail);
+    console.log(`[selftest] ✓ alert sent`);
+  } catch (e) {
+    console.error(`[selftest] FAILED: ${e.message}`);
+  }
+}
+
+// RFC 2047 'B' encoding so non-ASCII characters in the subject (the ⚠️
+// emoji, accented characters in the original subject, etc.) survive transit.
+export function mimeEncodeHeader(s) {
+  const bytes = new TextEncoder().encode(s);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return "=?UTF-8?B?" + btoa(binary) + "?=";
 }

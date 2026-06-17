@@ -2,6 +2,7 @@
   "name": "spam-email-extractor",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Cloudflare Worker that extracts spam email senders from Gmail, rates them with AI, and logs to Google Sheets",
   "main": "src/index.js",
   "scripts": {
