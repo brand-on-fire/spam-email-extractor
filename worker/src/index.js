@@ -62,10 +62,20 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Token gate (2026-07-17): manual triggers used to be wide open — anyone
+    // who found the URL could fire Gmail/Sheets/AI runs. Cron invocations use
+    // the scheduled() handler above and never pass through here, so gating
+    // fetch cannot affect the schedule. Fails closed if TRIGGER_SECRET is
+    // unset. Pass ?token=… or Authorization: Bearer …
+    const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+    const token = url.searchParams.get("token") || bearer;
+    const authorized = Boolean(env.TRIGGER_SECRET) && token === env.TRIGGER_SECRET;
+
     // Self-test: synthesize a class-action message and run it through the
     // real alert pipeline. Exercises gmail.send scope without needing a
     // real class-action notice to land in spam.
     if (url.searchParams.get("selftest") === "1") {
+      if (!authorized) return new Response("unauthorized", { status: 401 });
       ctx.waitUntil(runSelfTest(env));
       return new Response(
         `Self-test dispatched. A synthetic alert will be sent to ${CLASS_ACTION_RECIPIENT} ` +
@@ -76,6 +86,7 @@ export default {
 
     // Manual trigger: ?account=2 to run account 2, default is account 1
     if (url.pathname === "/__scheduled" || request.method === "POST") {
+      if (!authorized) return new Response("unauthorized", { status: 401 });
       const manualNum = parseInt(url.searchParams.get("account") || "1", 10);
       const account = getAccountConfig(env, manualNum);
       ctx.waitUntil(processSpam(env, account));
@@ -85,9 +96,10 @@ export default {
     }
     return new Response(
       "Spam Email Extractor Worker (Multi-Account)\n" +
-      "POST /__scheduled          → trigger Account 1\n" +
-      "POST /__scheduled?account=2 → trigger Account 2\n" +
-      "GET  /?selftest=1          → send synthetic class-action alert (verifies gmail.send scope)",
+      "All manual triggers require ?token=… (SPAM_EXTRACTOR_TRIGGER_SECRET in mastermind .env)\n" +
+      "POST /__scheduled?token=…            → trigger Account 1\n" +
+      "POST /__scheduled?account=2&token=…  → trigger Account 2\n" +
+      "GET  /?selftest=1&token=…            → send synthetic class-action alert (verifies gmail.send scope)",
       { status: 200 }
     );
   },
